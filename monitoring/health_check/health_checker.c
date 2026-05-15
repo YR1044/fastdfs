@@ -111,7 +111,7 @@ static void signal_handler(int sig) {
 /**
  * Check storage server health
  */
-static HealthStatus check_storage_health(FDFSStorageBrief *pStorage, 
+static HealthStatus check_storage_health(FDFSStorageInfo *pStorage, 
                                         FDFSStorageStat *pStorageStat,
                                         char *message, size_t msg_size) {
     time_t current_time = time(NULL);
@@ -172,7 +172,11 @@ static HealthStatus check_storage_health(FDFSStorageBrief *pStorage,
 static int perform_health_check(ClusterHealth *cluster_health) {
     ConnectionInfo *pTrackerServer;
     FDFSGroupStat group_stats[FDFS_MAX_GROUPS];
+    FDFSStorageInfo storage_infos[FDFS_MAX_SERVERS_EACH_GROUP];
+    FDFSStorageInfo *pStorage;
+    FDFSStorageInfo *pStorageEnd;
     int group_count;
+    int storage_count;
     int result;
     
     memset(cluster_health, 0, sizeof(ClusterHealth));
@@ -192,7 +196,7 @@ static int perform_health_check(ClusterHealth *cluster_health) {
                                  FDFS_MAX_GROUPS, &group_count);
     if (result != 0) {
         logError("Failed to list groups, error code: %d", result);
-        tracker_disconnect_server_ex(pTrackerServer, true);
+        conn_pool_disconnect_server(pTrackerServer);
         cluster_health->overall_status = HEALTH_CRITICAL;
         send_alert("CRITICAL", "Failed to query cluster status");
         return result;
@@ -205,16 +209,22 @@ static int perform_health_check(ClusterHealth *cluster_health) {
         FDFSGroupStat *pGroupStat = &group_stats[i];
         int group_healthy = 1;
         
-        cluster_health->total_storages += pGroupStat->count;
-        
+        if ((result=tracker_list_servers(pTrackerServer, pGroupStat->group_name,
+                        NULL, storage_infos, FDFS_MAX_SERVERS_EACH_GROUP,
+                        &storage_count)) != 0)
+        {
+            conn_pool_disconnect_server(pTrackerServer);
+            return result;
+        }
+        cluster_health->total_storages += storage_count;
+
         // Check each storage in the group
-        for (int j = 0; j < pGroupStat->count; j++) {
-            FDFSStorageBrief *pStorage = &pGroupStat->storage_servers[j];
-            FDFSStorageStat *pStorageStat = &pGroupStat->storage_stats[j];
+        pStorageEnd = storage_infos + storage_count;
+        for (pStorage = storage_infos; pStorage < pStorageEnd; pStorage++) {
             char message[256];
             HealthStatus status;
-            
-            status = check_storage_health(pStorage, pStorageStat, 
+
+            status = check_storage_health(pStorage, &pStorage->stat, 
                                          message, sizeof(message));
             
             switch (status) {
@@ -264,7 +274,7 @@ static int perform_health_check(ClusterHealth *cluster_health) {
         }
     }
     
-    tracker_disconnect_server_ex(pTrackerServer, true);
+    conn_pool_disconnect_server(pTrackerServer);
     return 0;
 }
 
@@ -362,11 +372,7 @@ int main(int argc, char *argv[]) {
     
     // Daemonize if requested
     if (daemon_mode) {
-        if (daemon(1, 0) != 0) {
-            printf("ERROR: Failed to daemonize\n");
-            fdfs_client_destroy();
-            return 1;
-        }
+        daemon_init(false);
     }
     
     // Main health check loop
